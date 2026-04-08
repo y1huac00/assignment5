@@ -49,6 +49,7 @@ class Config:
 
     max_new_tokens: int = 256
     eval_every: int = 100
+    log_every: int = 10
     eval_backend: str = "torch"
 
     max_train_examples: int | None = None
@@ -401,6 +402,7 @@ def save_checkpoint(model, tokenizer, save_dir: Path) -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
+    print(f"Saved checkpoint to: {save_dir}")
 
 def train_sft(
     model,
@@ -447,10 +449,27 @@ def train_sft(
         "val": [],
     }
 
+    effective_batch_size = cfg.train_batch_size * cfg.gradient_accumulation_steps
+    print("Starting SFT training...")
+    print(f"Train examples: {len(train_examples)}")
+    print(f"Val examples:   {len(val_examples)}")
+    print(f"Epochs:         {cfg.num_epochs}")
+    print(f"Train batch:    {cfg.train_batch_size}")
+    print(f"Grad accum:     {cfg.gradient_accumulation_steps}")
+    print(f"Effective batch:{effective_batch_size}")
+    print(f"Eval every:     {cfg.eval_every} optimizer step(s)")
+    print(f"Log every:      {cfg.log_every} optimizer step(s)")
+    print(f"Learning rate:  {cfg.learning_rate}")
+    print(f"Device:         {device}")
+
     # 先做一次训练前验证，方便画 curve
     initial_val = eval_fn(model, tokenizer, val_examples)
     initial_val["step"] = 0
     history["val"].append(initial_val)
+    print(
+        f"[validation] step=0 accuracy={initial_val['accuracy']:.4f} "
+        f"num_examples={initial_val['num_examples']}"
+    )
 
     best_val_acc = initial_val["accuracy"]
     save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
@@ -463,10 +482,16 @@ def train_sft(
 
     for epoch in range(cfg.num_epochs):
         model.train()
+        print(f"\nEpoch {epoch + 1}/{cfg.num_epochs}")
 
         remainder = len(train_loader) % cfg.gradient_accumulation_steps
 
-        for micro_idx, batch in tqdm(enumerate(train_loader)):
+        progress_bar = tqdm(
+            enumerate(train_loader),
+            total=len(train_loader),
+            desc=f"Epoch {epoch + 1}/{cfg.num_epochs}",
+        )
+        for micro_idx, batch in progress_bar:
             if remainder != 0 and micro_idx >= len(train_loader) - remainder:
                 current_accum_steps = remainder
             else:
@@ -516,6 +541,18 @@ def train_sft(
                     "lr": scheduler.get_last_lr()[0],
                 })
 
+                progress_bar.set_postfix(
+                    step=optimizer_step,
+                    loss=f"{running_group_loss:.4f}",
+                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                )
+                if optimizer_step == 1 or optimizer_step % cfg.log_every == 0:
+                    print(
+                        f"[train] epoch={epoch + 1} step={optimizer_step} "
+                        f"loss={running_group_loss:.4f} "
+                        f"lr={scheduler.get_last_lr()[0]:.2e}"
+                    )
+
                 running_group_loss = 0.0
                 microbatches_in_group = 0
 
@@ -523,21 +560,37 @@ def train_sft(
                     val_metrics = eval_fn(model, tokenizer, val_examples)
                     val_metrics["step"] = optimizer_step
                     history["val"].append(val_metrics)
+                    print(
+                        f"[validation] step={optimizer_step} "
+                        f"accuracy={val_metrics['accuracy']:.4f} "
+                        f"num_examples={val_metrics['num_examples']}"
+                    )
 
                     if val_metrics["accuracy"] > best_val_acc:
                         best_val_acc = val_metrics["accuracy"]
+                        print(
+                            f"New best validation accuracy: {best_val_acc:.4f} "
+                            f"at step {optimizer_step}"
+                        )
                         save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
 
     # 训练结束后再做一次验证
     final_val = eval_fn(model, tokenizer, val_examples)
     final_val["step"] = optimizer_step
     history["val"].append(final_val)
+    print(
+        f"[validation] final_step={optimizer_step} "
+        f"accuracy={final_val['accuracy']:.4f} "
+        f"num_examples={final_val['num_examples']}"
+    )
 
     if final_val["accuracy"] > best_val_acc:
         best_val_acc = final_val["accuracy"]
+        print(f"Final model is the new best checkpoint with accuracy {best_val_acc:.4f}")
         save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
 
     save_checkpoint(model, tokenizer, out_dir / "last_ckpt")
+    print("Finished SFT training.")
 
     return history
 
@@ -565,6 +618,7 @@ def parse_args() -> Config:
 
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--eval_every", type=int, default=100)
+    parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--eval_backend", type=str, default="torch", choices=["torch", "vllm"])
 
     parser.add_argument("--max_train_examples", type=int, default=None)
