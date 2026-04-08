@@ -38,9 +38,9 @@ class Config:
     seed: int = 42
 
     num_epochs: int = 1
-    train_batch_size: int = 8
-    eval_batch_size: int = 16
-    gradient_accumulation_steps: int = 2
+    train_batch_size: int = 4
+    eval_batch_size: int = 8
+    gradient_accumulation_steps: int = 8
 
     learning_rate: float = 2e-5
     weight_decay: float = 0.01
@@ -606,9 +606,9 @@ def parse_args() -> Config:
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--train_batch_size", type=int, default=8)
+    parser.add_argument("--train_batch_size", type=int, default=4)
     parser.add_argument("--eval_batch_size", type=int, default=8)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
 
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
