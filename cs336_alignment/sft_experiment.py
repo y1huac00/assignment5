@@ -589,7 +589,6 @@ def train_sft(
         print(f"Final model is the new best checkpoint with accuracy {best_val_acc:.4f}")
         save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
 
-    save_checkpoint(model, tokenizer, out_dir / "last_ckpt")
     print("Finished SFT training.")
 
     return history
@@ -703,18 +702,19 @@ def main():
     model.to(device)
 
     if cfg.eval_backend == "vllm":
-        eval_ckpt_dir = out_dir / "eval_ckpt"
 
         def eval_fn(eval_model, eval_tokenizer, examples):
-            save_checkpoint(eval_model, eval_tokenizer, eval_ckpt_dir)
-            return evaluate_gsm8k_vllm_subprocess(
-                model_path=eval_ckpt_dir,
-                examples=examples,
-                eval_batch_size=cfg.eval_batch_size,
-                max_new_tokens=cfg.max_new_tokens,
-                eval_gpu=cfg.eval_gpu,
-                vllm_gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
-            )
+            with tempfile.TemporaryDirectory(prefix="vllm_eval_ckpt_") as tmpdir:
+                eval_ckpt_dir = Path(tmpdir)
+                save_checkpoint(eval_model, eval_tokenizer, eval_ckpt_dir)
+                return evaluate_gsm8k_vllm_subprocess(
+                    model_path=eval_ckpt_dir,
+                    examples=examples,
+                    eval_batch_size=cfg.eval_batch_size,
+                    max_new_tokens=cfg.max_new_tokens,
+                    eval_gpu=cfg.eval_gpu,
+                    vllm_gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
+                )
     else:
 
         def eval_fn(eval_model, eval_tokenizer, examples):
