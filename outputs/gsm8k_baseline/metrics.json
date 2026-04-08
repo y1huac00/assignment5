@@ -1,0 +1,9 @@
+{
+  "num_examples": 1319,
+  "format_rate": 0.2350265352539803,
+  "answer_rate": 0.0,
+  "both_rate": 0.0,
+  "count_format1_answer1": 0,
+  "count_format1_answer0": 310,
+  "count_format0_answer0": 1009
+}
