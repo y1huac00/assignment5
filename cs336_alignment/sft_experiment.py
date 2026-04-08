@@ -607,9 +607,9 @@ def parse_args() -> Config:
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--train_batch_size", type=int, default=8)
-    parser.add_argument("--eval_batch_size", type=int, default=16)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
+    parser.add_argument("--train_batch_size", type=int, default=16)
+    parser.add_argument("--eval_batch_size", type=int, default=8)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
 
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
