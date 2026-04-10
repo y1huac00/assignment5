@@ -216,6 +216,8 @@ def build_sft_command(
     out_dir: Path,
     run_name: str,
     wandb_group: str,
+    learning_rate: str,
+    gradient_accumulation_steps: int,
     forwarded_args: list[str],
 ) -> list[str]:
     cmd = [
@@ -232,6 +234,10 @@ def build_sft_command(
         test_jsonl,
         "--out_dir",
         str(out_dir),
+        "--learning_rate",
+        learning_rate,
+        "--gradient_accumulation_steps",
+        str(gradient_accumulation_steps),
     ]
     cmd.extend(forwarded_args)
 
@@ -314,6 +320,8 @@ def main() -> None:
     parser.add_argument("--g_values", nargs="+", default=["4", "8", "16"])
     parser.add_argument("--db_sizes", nargs="+", default=["512", "1024", "2048"])
     parser.add_argument("--n_ei_steps", type=int, default=5)
+    parser.add_argument("--learning_rate", type=str, default="1e-5")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=16)
     parser.add_argument("--sample_gpu", type=int, default=1)
     parser.add_argument("--sampling_temperature", type=float, default=0.7)
     parser.add_argument("--sampling_top_p", type=float, default=1.0)
@@ -434,6 +442,8 @@ def main() -> None:
                     out_dir=sft_run_dir,
                     run_name=step_run_name,
                     wandb_group=wandb_group,
+                    learning_rate=args.learning_rate,
+                    gradient_accumulation_steps=args.gradient_accumulation_steps,
                     forwarded_args=forwarded_args,
                 )
                 print(" ".join(cmd))
