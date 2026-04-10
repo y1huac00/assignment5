@@ -96,24 +96,26 @@ def train_sft(
     print(f"Learning rate:  {cfg.learning_rate}")
     print(f"Device:         {device}")
 
-    initial_val = eval_fn(model, tokenizer, val_examples)
-    initial_val["step"] = 0
-    history["val"].append(initial_val)
-    print(
-        f"[validation] step=0 reward={initial_val['reward']:.4f} "
-        f"num_examples={initial_val['num_examples']}"
-    )
-    if wandb_run is not None:
-        wandb_run.log(
-            {
-                "val/step": 0,
-                "val/reward": initial_val["reward"],
-                "val/accuracy": initial_val["accuracy"],
-                "val/num_examples": initial_val["num_examples"],
-            }
+    best_val_reward = float("-inf")
+    if not cfg.skip_initial_val:
+        initial_val = eval_fn(model, tokenizer, val_examples)
+        initial_val["step"] = 0
+        history["val"].append(initial_val)
+        print(
+            f"[validation] step=0 reward={initial_val['reward']:.4f} "
+            f"num_examples={initial_val['num_examples']}"
         )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "val/step": 0,
+                    "val/reward": initial_val["reward"],
+                    "val/accuracy": initial_val["accuracy"],
+                    "val/num_examples": initial_val["num_examples"],
+                }
+            )
+        best_val_reward = initial_val["reward"]
 
-    best_val_reward = initial_val["reward"]
     save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
 
     def handle_val_result(step: int, val_metrics: dict[str, Any], ckpt_dir: Path | None = None) -> None:

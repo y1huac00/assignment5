@@ -238,6 +238,8 @@ def build_sft_command(
         learning_rate,
         "--gradient_accumulation_steps",
         str(gradient_accumulation_steps),
+        "--skip_initial_val",
+        "--skip_test",
     ]
     cmd.extend(forwarded_args)
 

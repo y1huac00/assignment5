@@ -201,6 +201,13 @@ def main():
     with open(out_dir / "history.json", "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
+    if cfg.skip_test:
+        print("Skipping final test evaluation.")
+        if wandb_run is not None:
+            wandb_run.finish()
+        print("Done.")
+        return
+
     print("Reloading best checkpoint for final test evaluation...")
     best_ckpt_dir = out_dir / "best_ckpt"
 

@@ -28,6 +28,8 @@ class Config:
     log_every: int = 10
     eval_backend: str = "torch"
     async_eval: bool = False
+    skip_initial_val: bool = False
+    skip_test: bool = False
     use_wandb: bool = False
     wandb_project: str = "cs336-alignment"
     wandb_entity: str | None = None
@@ -70,6 +72,8 @@ def parse_args() -> Config:
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--eval_backend", type=str, default="torch", choices=["torch", "vllm"])
     parser.add_argument("--async_eval", action="store_true")
+    parser.add_argument("--skip_initial_val", action="store_true")
+    parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="cs336-alignment")
     parser.add_argument("--wandb_entity", type=str, default=None)
