@@ -1,9 +1,11 @@
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +68,194 @@ def summarize_rewards(rewards: list[float]) -> dict[str, float]:
 
     reward = sum(rewards) / num_examples
     return {"num_examples": num_examples, "reward": reward, "accuracy": reward}
+
+
+@dataclass
+class CompletedAsyncEvalResult:
+    step: int
+    metrics: dict[str, Any]
+    ckpt_dir: Path
+    log_path: Path
+
+
+@dataclass
+class _PendingEvalCheckpoint:
+    step: int
+    ckpt_dir: Path
+
+
+@dataclass
+class _ActiveEvalJob:
+    step: int
+    ckpt_dir: Path
+    payload_path: Path
+    output_path: Path
+    log_path: Path
+    process: subprocess.Popen
+    log_handle: Any
+
+
+class AsyncVLLMEvalManager:
+    def __init__(
+        self,
+        *,
+        tokenizer_path: str,
+        examples: list[dict[str, Any]],
+        eval_batch_size: int,
+        max_new_tokens: int,
+        eval_gpu: int,
+        vllm_gpu_memory_utilization: float,
+        work_dir: Path,
+        checkpoint_saver,
+        max_logged_examples: int = 5,
+    ) -> None:
+        self.tokenizer_path = tokenizer_path
+        self.examples = examples
+        self.eval_batch_size = eval_batch_size
+        self.max_new_tokens = max_new_tokens
+        self.eval_gpu = eval_gpu
+        self.vllm_gpu_memory_utilization = vllm_gpu_memory_utilization
+        self.checkpoint_saver = checkpoint_saver
+        self.max_logged_examples = max_logged_examples
+
+        self.work_dir = work_dir
+        self.ckpt_dir_root = self.work_dir / "ckpts"
+        self.job_dir_root = self.work_dir / "jobs"
+        self.log_dir_root = self.work_dir / "logs"
+        self.repo_root = Path(__file__).resolve().parents[1]
+
+        self.ckpt_dir_root.mkdir(parents=True, exist_ok=True)
+        self.job_dir_root.mkdir(parents=True, exist_ok=True)
+        self.log_dir_root.mkdir(parents=True, exist_ok=True)
+
+        self.active_job: _ActiveEvalJob | None = None
+        self.pending_checkpoint: _PendingEvalCheckpoint | None = None
+        self.last_submitted_step: int | None = None
+
+    def submit(self, step: int, model, tokenizer) -> None:
+        ckpt_dir = self.ckpt_dir_root / f"step_{step:07d}"
+        self.checkpoint_saver(model, tokenizer, ckpt_dir)
+        self.last_submitted_step = step
+
+        if self.active_job is None:
+            self._launch_job(step=step, ckpt_dir=ckpt_dir)
+            print(f"[async-eval] launched validation job for step={step}")
+            return
+
+        if self.pending_checkpoint is not None:
+            self.cleanup_checkpoint(self.pending_checkpoint.ckpt_dir)
+            print(
+                f"[async-eval] replaced pending validation job "
+                f"step={self.pending_checkpoint.step} with step={step}"
+            )
+        else:
+            print(f"[async-eval] queued latest validation job for step={step}")
+
+        self.pending_checkpoint = _PendingEvalCheckpoint(step=step, ckpt_dir=ckpt_dir)
+
+    def poll(self) -> list[CompletedAsyncEvalResult]:
+        result = self._consume_active_job(wait=False)
+        if result is None:
+            return []
+        return [result]
+
+    def wait_for_all(self) -> list[CompletedAsyncEvalResult]:
+        results: list[CompletedAsyncEvalResult] = []
+        while self.active_job is not None or self.pending_checkpoint is not None:
+            if self.active_job is None and self.pending_checkpoint is not None:
+                pending = self.pending_checkpoint
+                self.pending_checkpoint = None
+                self._launch_job(step=pending.step, ckpt_dir=pending.ckpt_dir)
+
+            result = self._consume_active_job(wait=True)
+            if result is not None:
+                results.append(result)
+        return results
+
+    def cleanup_checkpoint(self, ckpt_dir: Path) -> None:
+        if ckpt_dir.exists():
+            shutil.rmtree(ckpt_dir)
+
+    def _launch_job(self, *, step: int, ckpt_dir: Path) -> None:
+        payload = {
+            "examples": self.examples,
+            "eval_batch_size": self.eval_batch_size,
+            "max_new_tokens": self.max_new_tokens,
+            "max_logged_examples": self.max_logged_examples,
+            "gpu_memory_utilization": self.vllm_gpu_memory_utilization,
+        }
+
+        payload_path = self.job_dir_root / f"step_{step:07d}_payload.json"
+        output_path = self.job_dir_root / f"step_{step:07d}_output.json"
+        log_path = self.log_dir_root / f"step_{step:07d}.log"
+
+        with open(payload_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(self.eval_gpu)
+        env["CS336_VLLM_EVAL_WORKER"] = "1"
+        env["CS336_VLLM_MODEL_PATH"] = str(ckpt_dir)
+        env["CS336_VLLM_TOKENIZER_PATH"] = self.tokenizer_path
+        env["CS336_VLLM_PAYLOAD_PATH"] = str(payload_path)
+        env["CS336_VLLM_OUTPUT_PATH"] = str(output_path)
+        env["VLLM_LOGGING_LEVEL"] = "ERROR"
+        env["VLLM_NO_USAGE_STATS"] = "1"
+        env["VLLM_DO_NOT_TRACK"] = "1"
+
+        cmd = [sys.executable, "-m", "cs336_alignment.sft_experiment"]
+        log_handle = open(log_path, "w", encoding="utf-8")
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            cwd=self.repo_root,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        self.active_job = _ActiveEvalJob(
+            step=step,
+            ckpt_dir=ckpt_dir,
+            payload_path=payload_path,
+            output_path=output_path,
+            log_path=log_path,
+            process=process,
+            log_handle=log_handle,
+        )
+
+    def _consume_active_job(self, *, wait: bool) -> CompletedAsyncEvalResult | None:
+        if self.active_job is None:
+            return None
+
+        active_job = self.active_job
+        returncode = active_job.process.wait() if wait else active_job.process.poll()
+        if returncode is None:
+            return None
+
+        active_job.log_handle.close()
+        self.active_job = None
+
+        if returncode != 0:
+            raise RuntimeError(
+                "Async vLLM eval subprocess failed. "
+                f"step={active_job.step} return_code={returncode}. "
+                f"See log: {active_job.log_path}"
+            )
+
+        with open(active_job.output_path, "r", encoding="utf-8") as f:
+            metrics = json.load(f)
+
+        if self.pending_checkpoint is not None:
+            pending = self.pending_checkpoint
+            self.pending_checkpoint = None
+            self._launch_job(step=pending.step, ckpt_dir=pending.ckpt_dir)
+            print(f"[async-eval] launched queued validation job for step={pending.step}")
+
+        return CompletedAsyncEvalResult(
+            step=active_job.step,
+            metrics=metrics,
+            ckpt_dir=active_job.ckpt_dir,
+            log_path=active_job.log_path,
+        )
 
 
 @torch.no_grad()

@@ -27,6 +27,7 @@ class Config:
     eval_every: int = 100
     log_every: int = 10
     eval_backend: str = "torch"
+    async_eval: bool = False
 
     max_train_examples: int | None = None
     max_val_examples: int | None = None
@@ -63,6 +64,7 @@ def parse_args() -> Config:
     parser.add_argument("--eval_every", type=int, default=100)
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--eval_backend", type=str, default="torch", choices=["torch", "vllm"])
+    parser.add_argument("--async_eval", action="store_true")
 
     parser.add_argument("--max_train_examples", type=int, default=None)
     parser.add_argument("--max_val_examples", type=int, default=None)

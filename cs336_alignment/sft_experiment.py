@@ -19,6 +19,7 @@ try:
         split_train_val,
     )
     from .sft_eval import (
+        AsyncVLLMEvalManager,
         evaluate_gsm8k,
         evaluate_gsm8k_vllm_subprocess,
         run_vllm_eval_worker,
@@ -36,6 +37,7 @@ except ImportError:
         split_train_val,
     )
     from sft_eval import (
+        AsyncVLLMEvalManager,
         evaluate_gsm8k,
         evaluate_gsm8k_vllm_subprocess,
         run_vllm_eval_worker,
@@ -102,6 +104,9 @@ def main():
             raise ValueError("eval_backend=vllm requires CUDA, but CUDA is not available.")
         print("CUDA not available; running on CPU.")
 
+    if cfg.async_eval and cfg.eval_backend != "vllm":
+        raise ValueError("async_eval currently requires eval_backend=vllm.")
+
     model_kwargs = {"trust_remote_code": True}
     if device.type == "cuda":
         model_kwargs["torch_dtype"] = dtype
@@ -137,6 +142,20 @@ def main():
                 device=device,
             )
 
+    async_eval_manager = None
+    if cfg.async_eval:
+        async_eval_manager = AsyncVLLMEvalManager(
+            tokenizer_path=cfg.model_name,
+            examples=val_examples,
+            eval_batch_size=cfg.eval_batch_size,
+            max_new_tokens=cfg.max_new_tokens,
+            eval_gpu=cfg.eval_gpu,
+            vllm_gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
+            work_dir=out_dir / "async_eval",
+            checkpoint_saver=save_checkpoint,
+        )
+        print(f"Async vLLM validation enabled on eval GPU cuda:{cfg.eval_gpu}")
+
     history = train_sft(
         model=model,
         tokenizer=tokenizer,
@@ -146,6 +165,7 @@ def main():
         device=device,
         out_dir=out_dir,
         eval_fn=eval_fn,
+        async_eval_manager=async_eval_manager,
     )
 
     with open(out_dir / "history.json", "w", encoding="utf-8") as f:

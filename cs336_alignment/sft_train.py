@@ -1,4 +1,5 @@
 import math
+import shutil
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,6 +23,13 @@ def save_checkpoint(model, tokenizer, save_dir: Path) -> None:
     print(f"Saved checkpoint to: {save_dir}")
 
 
+def promote_checkpoint(src_dir: Path, dst_dir: Path) -> None:
+    if dst_dir.exists():
+        shutil.rmtree(dst_dir)
+    shutil.copytree(src_dir, dst_dir)
+    print(f"Promoted checkpoint to best: {dst_dir}")
+
+
 def train_sft(
     model,
     tokenizer,
@@ -31,6 +39,7 @@ def train_sft(
     device: torch.device,
     out_dir: Path,
     eval_fn: Callable,
+    async_eval_manager=None,
 ) -> dict[str, Any]:
     train_dataset = GSM8KSFTDataset(train_examples)
     collate_fn = make_sft_collate_fn(tokenizer)
@@ -86,6 +95,25 @@ def train_sft(
 
     best_val_reward = initial_val["reward"]
     save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
+
+    def handle_val_result(step: int, val_metrics: dict[str, Any], ckpt_dir: Path | None = None) -> None:
+        nonlocal best_val_reward
+
+        val_metrics["step"] = step
+        history["val"].append(val_metrics)
+        print(
+            f"[validation] step={step} "
+            f"reward={val_metrics['reward']:.4f} "
+            f"num_examples={val_metrics['num_examples']}"
+        )
+
+        if val_metrics["reward"] > best_val_reward:
+            best_val_reward = val_metrics["reward"]
+            print(f"New best validation reward: {best_val_reward:.4f} at step {step}")
+            if ckpt_dir is None:
+                save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
+            else:
+                promote_checkpoint(ckpt_dir, out_dir / "best_ckpt")
 
     optimizer.zero_grad(set_to_none=True)
     optimizer_step = 0
@@ -168,36 +196,63 @@ def train_sft(
             running_group_loss = 0.0
             microbatches_in_group = 0
 
+            if async_eval_manager is not None:
+                for completed in async_eval_manager.poll():
+                    handle_val_result(
+                        step=completed.step,
+                        val_metrics=completed.metrics,
+                        ckpt_dir=completed.ckpt_dir,
+                    )
+                    async_eval_manager.cleanup_checkpoint(completed.ckpt_dir)
+
             if optimizer_step % cfg.eval_every != 0:
                 continue
 
+            if async_eval_manager is not None:
+                async_eval_manager.submit(optimizer_step, model, tokenizer)
+                continue
+
             val_metrics = eval_fn(model, tokenizer, val_examples)
-            val_metrics["step"] = optimizer_step
-            history["val"].append(val_metrics)
-            print(
-                f"[validation] step={optimizer_step} "
-                f"reward={val_metrics['reward']:.4f} "
-                f"num_examples={val_metrics['num_examples']}"
+            handle_val_result(step=optimizer_step, val_metrics=val_metrics)
+
+    if async_eval_manager is not None:
+        for completed in async_eval_manager.poll():
+            handle_val_result(
+                step=completed.step,
+                val_metrics=completed.metrics,
+                ckpt_dir=completed.ckpt_dir,
             )
+            async_eval_manager.cleanup_checkpoint(completed.ckpt_dir)
 
-            if val_metrics["reward"] > best_val_reward:
-                best_val_reward = val_metrics["reward"]
-                print(f"New best validation reward: {best_val_reward:.4f} at step {optimizer_step}")
-                save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
+        if async_eval_manager.last_submitted_step != optimizer_step:
+            async_eval_manager.submit(optimizer_step, model, tokenizer)
 
-    final_val = eval_fn(model, tokenizer, val_examples)
-    final_val["step"] = optimizer_step
-    history["val"].append(final_val)
-    print(
-        f"[validation] final_step={optimizer_step} "
-        f"reward={final_val['reward']:.4f} "
-        f"num_examples={final_val['num_examples']}"
-    )
+        print("[async-eval] waiting for outstanding validation jobs...")
+        final_val = None
+        for completed in async_eval_manager.wait_for_all():
+            handle_val_result(
+                step=completed.step,
+                val_metrics=completed.metrics,
+                ckpt_dir=completed.ckpt_dir,
+            )
+            if completed.step == optimizer_step:
+                final_val = completed.metrics
+            async_eval_manager.cleanup_checkpoint(completed.ckpt_dir)
 
-    if final_val["reward"] > best_val_reward:
-        best_val_reward = final_val["reward"]
-        print(f"Final model is the new best checkpoint with reward {best_val_reward:.4f}")
-        save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
+        if final_val is not None:
+            print(
+                f"[validation] final_step={optimizer_step} "
+                f"reward={final_val['reward']:.4f} "
+                f"num_examples={final_val['num_examples']}"
+            )
+    else:
+        final_val = eval_fn(model, tokenizer, val_examples)
+        handle_val_result(step=optimizer_step, val_metrics=final_val)
+        print(
+            f"[validation] final_step={optimizer_step} "
+            f"reward={final_val['reward']:.4f} "
+            f"num_examples={final_val['num_examples']}"
+        )
 
     print("Finished SFT training.")
     return history
