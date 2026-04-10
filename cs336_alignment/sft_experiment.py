@@ -305,8 +305,14 @@ def evaluate_gsm8k(
 ) -> dict[str, Any]:
     sample_records = []
     reward_infos = []
+    num_batches = math.ceil(len(examples) / eval_batch_size) if eval_batch_size > 0 else 0
 
-    for start in range(0, len(examples), eval_batch_size):
+    for start in tqdm(
+        range(0, len(examples), eval_batch_size),
+        total=num_batches,
+        desc="Evaluating",
+        leave=False,
+    ):
         batch_examples = examples[start:start + eval_batch_size]
 
         prompt_strs = [build_prompt(ex["question"]) for ex in batch_examples]
@@ -375,8 +381,14 @@ def run_vllm_eval_worker() -> None:
 
     sample_records = []
     reward_infos = []
+    num_batches = math.ceil(len(examples) / eval_batch_size) if eval_batch_size > 0 else 0
 
-    for start in range(0, len(examples), eval_batch_size):
+    for start in tqdm(
+        range(0, len(examples), eval_batch_size),
+        total=num_batches,
+        desc="Evaluating (vLLM)",
+        leave=False,
+    ):
         batch_examples = examples[start:start + eval_batch_size]
         prompt_strs = [build_prompt(ex["question"]) for ex in batch_examples]
         gold_answers = [ex["answer"] for ex in batch_examples]
