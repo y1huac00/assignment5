@@ -342,6 +342,7 @@ def evaluate_gsm8k(
 
 def run_vllm_eval_worker() -> None:
     model_path = os.environ["CS336_VLLM_MODEL_PATH"]
+    tokenizer_path = os.environ["CS336_VLLM_TOKENIZER_PATH"]
     payload_path = os.environ["CS336_VLLM_PAYLOAD_PATH"]
     output_path = os.environ["CS336_VLLM_OUTPUT_PATH"]
 
@@ -358,6 +359,7 @@ def run_vllm_eval_worker() -> None:
 
     llm = LLM(
         model=model_path,
+        tokenizer=tokenizer_path,
         tensor_parallel_size=1,
         trust_remote_code=True,
         gpu_memory_utilization=gpu_memory_utilization,
@@ -408,6 +410,7 @@ def run_vllm_eval_worker() -> None:
 
 def evaluate_gsm8k_vllm_subprocess(
     model_path: Path,
+    tokenizer_path: str,
     examples: list[dict[str, Any]],
     eval_batch_size: int,
     max_new_tokens: int,
@@ -433,6 +436,7 @@ def evaluate_gsm8k_vllm_subprocess(
         env["CUDA_VISIBLE_DEVICES"] = str(eval_gpu)
         env["CS336_VLLM_EVAL_WORKER"] = "1"
         env["CS336_VLLM_MODEL_PATH"] = str(model_path)
+        env["CS336_VLLM_TOKENIZER_PATH"] = tokenizer_path
         env["CS336_VLLM_PAYLOAD_PATH"] = str(payload_path)
         env["CS336_VLLM_OUTPUT_PATH"] = str(output_path)
 
@@ -771,6 +775,7 @@ def main():
                 save_checkpoint(eval_model, eval_tokenizer, eval_ckpt_dir)
                 return evaluate_gsm8k_vllm_subprocess(
                     model_path=eval_ckpt_dir,
+                    tokenizer_path=cfg.model_name,
                     examples=examples,
                     eval_batch_size=cfg.eval_batch_size,
                     max_new_tokens=cfg.max_new_tokens,
@@ -809,6 +814,7 @@ def main():
     if cfg.eval_backend == "vllm":
         test_metrics = evaluate_gsm8k_vllm_subprocess(
             model_path=best_ckpt_dir,
+            tokenizer_path=cfg.model_name,
             examples=test_examples,
             eval_batch_size=cfg.eval_batch_size,
             max_new_tokens=cfg.max_new_tokens,
