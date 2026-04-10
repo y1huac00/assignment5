@@ -7,6 +7,7 @@ Example:
 python scripts/run_sft_hparam_sweep.py \
     --learning_rates 1e-5 2e-5 5e-5 \
     --gradient_accumulation_steps 4 8 16 \
+    --num_evals 10 \
     --eval_backend vllm \
     --train_gpu 0 \
     --eval_gpu 1

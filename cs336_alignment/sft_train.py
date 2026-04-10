@@ -40,6 +40,7 @@ def train_sft(
     out_dir: Path,
     eval_fn: Callable,
     async_eval_manager=None,
+    wandb_run=None,
 ) -> dict[str, Any]:
     train_dataset = GSM8KSFTDataset(train_examples)
     collate_fn = make_sft_collate_fn(tokenizer)
@@ -73,6 +74,13 @@ def train_sft(
     history = {"train": [], "val": []}
 
     effective_batch_size = cfg.train_batch_size * cfg.gradient_accumulation_steps
+    num_evals = max(1, cfg.num_evals)
+    scheduled_eval_steps = sorted(
+        {
+            min(total_optimizer_steps, max(1, math.ceil(i * total_optimizer_steps / num_evals)))
+            for i in range(1, num_evals + 1)
+        }
+    )
     print("Starting SFT training...")
     print(f"Train examples: {len(train_examples)}")
     print(f"Val examples:   {len(val_examples)}")
@@ -80,7 +88,10 @@ def train_sft(
     print(f"Train batch:    {cfg.train_batch_size}")
     print(f"Grad accum:     {cfg.gradient_accumulation_steps}")
     print(f"Effective batch:{effective_batch_size}")
-    print(f"Eval every:     {cfg.eval_every} optimizer step(s)")
+    print(
+        "Scheduled evals:"
+        f" {len(scheduled_eval_steps)} time(s) at optimizer steps {scheduled_eval_steps}"
+    )
     print(f"Log every:      {cfg.log_every} optimizer step(s)")
     print(f"Learning rate:  {cfg.learning_rate}")
     print(f"Device:         {device}")
@@ -92,6 +103,15 @@ def train_sft(
         f"[validation] step=0 reward={initial_val['reward']:.4f} "
         f"num_examples={initial_val['num_examples']}"
     )
+    if wandb_run is not None:
+        wandb_run.log(
+            {
+                "val/step": 0,
+                "val/reward": initial_val["reward"],
+                "val/accuracy": initial_val["accuracy"],
+                "val/num_examples": initial_val["num_examples"],
+            }
+        )
 
     best_val_reward = initial_val["reward"]
     save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
@@ -106,6 +126,16 @@ def train_sft(
             f"reward={val_metrics['reward']:.4f} "
             f"num_examples={val_metrics['num_examples']}"
         )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "val/step": step,
+                    "val/reward": val_metrics["reward"],
+                    "val/accuracy": val_metrics["accuracy"],
+                    "val/num_examples": val_metrics["num_examples"],
+                    "val/best_reward_so_far": max(best_val_reward, val_metrics["reward"]),
+                }
+            )
 
         if val_metrics["reward"] > best_val_reward:
             best_val_reward = val_metrics["reward"]
@@ -192,6 +222,15 @@ def train_sft(
                     f"loss={running_group_loss:.4f} "
                     f"lr={scheduler.get_last_lr()[0]:.2e}"
                 )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "train/step": optimizer_step,
+                        "train/epoch": epoch + 1,
+                        "train/loss": running_group_loss,
+                        "train/lr": scheduler.get_last_lr()[0],
+                    }
+                )
 
             running_group_loss = 0.0
             microbatches_in_group = 0
@@ -205,7 +244,7 @@ def train_sft(
                     )
                     async_eval_manager.cleanup_checkpoint(completed.ckpt_dir)
 
-            if optimizer_step % cfg.eval_every != 0:
+            if optimizer_step not in scheduled_eval_steps:
                 continue
 
             if async_eval_manager is not None:
@@ -246,13 +285,23 @@ def train_sft(
                 f"num_examples={final_val['num_examples']}"
             )
     else:
-        final_val = eval_fn(model, tokenizer, val_examples)
-        handle_val_result(step=optimizer_step, val_metrics=final_val)
-        print(
-            f"[validation] final_step={optimizer_step} "
-            f"reward={final_val['reward']:.4f} "
-            f"num_examples={final_val['num_examples']}"
-        )
+        if optimizer_step in scheduled_eval_steps:
+            final_val = history["val"][-1]
+            print(
+                f"[validation] final_step={optimizer_step} "
+                f"reward={final_val['reward']:.4f} "
+                f"num_examples={final_val['num_examples']}"
+            )
+        else:
+            final_val = eval_fn(model, tokenizer, val_examples)
+            handle_val_result(step=optimizer_step, val_metrics=final_val)
+            print(
+                f"[validation] final_step={optimizer_step} "
+                f"reward={final_val['reward']:.4f} "
+                f"num_examples={final_val['num_examples']}"
+            )
 
     print("Finished SFT training.")
+    if wandb_run is not None:
+        wandb_run.summary["best_val_reward"] = best_val_reward
     return history

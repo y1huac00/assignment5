@@ -7,7 +7,8 @@ python scripts/run_sft_data_scaling.py \
     --model_name Qwen/Qwen2.5-Math-1.5B \
     --train_gpu 0 \
     --eval_backend torch \
-    --num_epochs 1
+    --num_epochs 1 \
+    --num_evals 10
 """
 
 from __future__ import annotations

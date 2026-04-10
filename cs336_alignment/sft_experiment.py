@@ -52,6 +52,29 @@ def main():
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    wandb_run = None
+    if cfg.use_wandb:
+        try:
+            import wandb
+        except ImportError as exc:
+            raise ImportError(
+                "use_wandb=True but wandb is not installed. "
+                "Install it with `pip install wandb`."
+            ) from exc
+
+        wandb_run = wandb.init(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity,
+            name=cfg.wandb_name,
+            group=cfg.wandb_group,
+            config=asdict(cfg),
+            dir=str(out_dir),
+        )
+        wandb.define_metric("train/step")
+        wandb.define_metric("train/*", step_metric="train/step")
+        wandb.define_metric("val/step")
+        wandb.define_metric("val/*", step_metric="val/step")
+
     with open(out_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump(asdict(cfg), f, ensure_ascii=False, indent=2)
 
@@ -77,6 +100,10 @@ def main():
     print(f"train size: {len(train_examples)}")
     print(f"val size:   {len(val_examples)}")
     print(f"test size:  {len(test_examples)}")
+    if wandb_run is not None:
+        wandb_run.summary["train_size"] = len(train_examples)
+        wandb_run.summary["val_size"] = len(val_examples)
+        wandb_run.summary["test_size"] = len(test_examples)
 
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.model_name,
@@ -166,6 +193,7 @@ def main():
         out_dir=out_dir,
         eval_fn=eval_fn,
         async_eval_manager=async_eval_manager,
+        wandb_run=wandb_run,
     )
 
     with open(out_dir / "history.json", "w", encoding="utf-8") as f:
@@ -203,6 +231,19 @@ def main():
 
     with open(out_dir / "test_metrics.json", "w", encoding="utf-8") as f:
         json.dump(test_metrics, f, ensure_ascii=False, indent=2)
+
+    if wandb_run is not None:
+        wandb_run.log(
+            {
+                "test/reward": test_metrics["reward"],
+                "test/accuracy": test_metrics["accuracy"],
+                "test/num_examples": test_metrics["num_examples"],
+            }
+        )
+        wandb_run.summary["test_reward"] = test_metrics["reward"]
+        wandb_run.summary["test_accuracy"] = test_metrics["accuracy"]
+        wandb_run.summary["test_num_examples"] = test_metrics["num_examples"]
+        wandb_run.finish()
 
     print(f"Final test reward: {test_metrics['reward']:.4f}")
     print("Done.")
