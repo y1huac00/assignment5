@@ -35,14 +35,14 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def build_run_command(
-    experiment_script: Path,
     run_out_dir: Path,
     size: str,
     forwarded_args: list[str],
 ) -> list[str]:
     cmd = [
         sys.executable,
-        str(experiment_script),
+        "-m",
+        "cs336_alignment.sft_experiment",
         "--out_dir",
         str(run_out_dir),
     ]
@@ -118,7 +118,6 @@ def main() -> None:
     args, forwarded_args = parser.parse_known_args()
 
     repo_root = Path(__file__).resolve().parents[1]
-    experiment_script = repo_root / "cs336_alignment" / "sft_experiment.py"
     base_out_dir = Path(args.base_out_dir)
     base_out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -133,7 +132,6 @@ def main() -> None:
             print(f"[skip] train_size={size} already has {test_metrics_path}")
         else:
             cmd = build_run_command(
-                experiment_script=experiment_script,
                 run_out_dir=run_out_dir,
                 size=size,
                 forwarded_args=forwarded_args,
