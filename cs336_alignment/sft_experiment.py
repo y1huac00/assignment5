@@ -1,682 +1,46 @@
-import argparse
 import json
-import math
 import os
-import random
-import subprocess
-import sys
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any
-
-from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
-from tqdm import tqdm
 
 import torch
-from torch.utils.data import DataLoader, Dataset 
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    get_linear_schedule_with_warmup,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
-    from .helper import (
-        tokenize_prompt_and_output,
-        get_response_log_probs,
-        sft_microbatch_train_step,
+    from .sft_config import parse_args
+    from .sft_data import (
+        choose_torch_dtype,
+        load_jsonl,
+        maybe_truncate,
+        resolve_train_device,
+        save_jsonl,
+        set_seed,
+        split_train_val,
     )
+    from .sft_eval import (
+        evaluate_gsm8k,
+        evaluate_gsm8k_vllm_subprocess,
+        run_vllm_eval_worker,
+    )
+    from .sft_train import save_checkpoint, train_sft
 except ImportError:
-    from helper import (
-        tokenize_prompt_and_output,
-        get_response_log_probs,
-        sft_microbatch_train_step,
+    from sft_config import parse_args
+    from sft_data import (
+        choose_torch_dtype,
+        load_jsonl,
+        maybe_truncate,
+        resolve_train_device,
+        save_jsonl,
+        set_seed,
+        split_train_val,
     )
-
-@dataclass
-class Config:
-    train_jsonl: str = './data/gsm8k/train.jsonl'
-    test_jsonl: str = './data/gsm8k/test.jsonl'
-    out_dir: str = './outputs/gsm8k_sft'
-
-    model_name: str = "Qwen/Qwen2.5-Math-1.5B"
-    val_jsonl: str | None = None
-    val_ratio: float = 0.1
-    seed: int = 42
-
-    num_epochs: int = 1
-    train_batch_size: int = 4
-    eval_batch_size: int = 8
-    gradient_accumulation_steps: int = 8
-
-    learning_rate: float = 2e-5
-    weight_decay: float = 0.01
-    warmup_ratio: float = 0.03
-    max_grad_norm: float = 1.0
-
-    max_new_tokens: int = 256
-    eval_every: int = 100
-    log_every: int = 10
-    eval_backend: str = "torch"
-
-    max_train_examples: int | None = None
-    max_val_examples: int | None = None
-    max_test_examples: int | None = None
-
-    train_gpu: int = 0
-    eval_gpu: int = 1
-    vllm_gpu_memory_utilization: float = 0.85
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-def load_jsonl(path: str) -> list[dict[str, Any]]:
-    data = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            data.append(json.loads(line))
-    return data
-
-
-def save_jsonl(path: str, data: list[dict[str, Any]]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        for ex in data:
-            f.write(json.dumps(ex, ensure_ascii=False) + "\n")
-
-def split_train_val(
-    examples: list[dict[str, Any]],
-    val_ratio: float,
-    seed: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    examples = examples.copy()
-    rng = random.Random(seed)
-    rng.shuffle(examples)
-
-    n_val = max(1, int(len(examples) * val_ratio))
-    val_examples = examples[:n_val]
-    train_examples = examples[n_val:]
-    return train_examples, val_examples
-
-def maybe_truncate(
-    examples: list[dict[str, Any]],
-    max_examples: int | None,
-) -> list[dict[str, Any]]:
-    if max_examples is None:
-        return examples
-    return examples[:max_examples]
-
-def build_prompt(question: str) -> str:
-    question = question.strip()
-    return f"Question: {question}\nAnswer:"
-
-
-def build_train_response(answer: str) -> str:
-    return " " + answer.strip()
-
-
-def truncate_response_for_reward(text: str) -> str:
-    end_tag = "</answer>"
-    if end_tag in text:
-        end_idx = text.index(end_tag) + len(end_tag)
-        return text[:end_idx].strip()
-    return text.strip()
-
-
-def prepare_text_for_math_verify(text: str) -> str:
-    text = truncate_response_for_reward(text).strip()
-    if "####" in text:
-        text = text.split("####")[-1].strip()
-    return text
-
-
-def reward_fn(pred_text: str, gold_text: str) -> float:
-    try:
-        gold_parsed = parse(
-            prepare_text_for_math_verify(gold_text),
-            extraction_config=(
-                LatexExtractionConfig(boxed_match_priority=0),
-                ExprExtractionConfig(),
-            ),
-            fallback_mode="no_fallback",
-            extraction_mode="first_match",
-            parsing_timeout=1,
-        )
-        pred_parsed = parse(
-            prepare_text_for_math_verify(pred_text),
-            extraction_config=(
-                LatexExtractionConfig(boxed_match_priority=0),
-                ExprExtractionConfig(),
-            ),
-            fallback_mode="no_fallback",
-            extraction_mode="first_match",
-            parsing_timeout=1,
-        )
-        return 1.0 if verify(gold_parsed, pred_parsed) else 0.0
-    except Exception:
-        return 0.0
-
-
-def summarize_rewards(rewards: list[float]) -> dict[str, float]:
-    num_examples = len(rewards)
-    if num_examples == 0:
-        return {
-            "num_examples": 0,
-            "reward": 0.0,
-            "accuracy": 0.0,
-        }
-
-    reward = sum(rewards) / num_examples
-
-    return {
-        "num_examples": num_examples,
-        "reward": reward,
-        "accuracy": reward,
-    }
-
-
-def choose_torch_dtype() -> torch.dtype:
-    if not torch.cuda.is_available():
-        return torch.float32
-    if torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    return torch.float16
-
-
-def resolve_train_device(train_gpu: int) -> torch.device:
-    if not torch.cuda.is_available():
-        return torch.device("cpu")
-
-    gpu_count = torch.cuda.device_count()
-    if train_gpu < 0 or train_gpu >= gpu_count:
-        raise ValueError(
-            f"Requested train_gpu={train_gpu}, but only {gpu_count} CUDA device(s) are available."
-        )
-
-    return torch.device(f"cuda:{train_gpu}")
-
-
-class GSM8KSFTDataset(Dataset):
-    def __init__(self, examples: list[dict[str, Any]]):
-        self.examples = examples
-
-    def __len__(self) -> int:
-        return len(self.examples)
-
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        return self.examples[idx]
-
-
-def make_sft_collate_fn(tokenizer):
-    def collate_fn(examples: list[dict[str, Any]]) -> dict[str, Any]:
-        prompt_strs = [build_prompt(ex["question"]) for ex in examples]
-        output_strs = [build_train_response(ex["answer"]) for ex in examples]
-
-        tokenized = tokenize_prompt_and_output(
-            prompts=prompt_strs,
-            outputs=output_strs,
-            tokenizer=tokenizer,
-        )
-
-        tokenized["prompt_strs"] = prompt_strs
-        tokenized["output_strs"] = output_strs
-        return tokenized
-
-    return collate_fn
-
-@torch.no_grad()
-def generate_responses(
-    model,
-    tokenizer,
-    prompt_strs: list[str],
-    max_new_tokens: int,
-    device: torch.device,
-) -> list[str]:
-    was_training = model.training
-    model.eval()
-
-    old_padding_side = tokenizer.padding_side
-    tokenizer.padding_side = "left"
-
-    batch = tokenizer(
-        prompt_strs,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        add_special_tokens=False,
+    from sft_eval import (
+        evaluate_gsm8k,
+        evaluate_gsm8k_vllm_subprocess,
+        run_vllm_eval_worker,
     )
-    batch = {k: v.to(device) for k, v in batch.items()}
-
-    input_len = batch["input_ids"].shape[1]
-
-    generated_ids = model.generate(
-        input_ids=batch["input_ids"],
-        attention_mask=batch["attention_mask"],
-        max_new_tokens=max_new_tokens,
-        do_sample=False,   # 验证时先用 greedy
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
-
-    new_token_ids = generated_ids[:, input_len:]
-    response_strs = tokenizer.batch_decode(
-        new_token_ids,
-        skip_special_tokens=True,
-    )
-
-    tokenizer.padding_side = old_padding_side
-    if was_training:
-        model.train()
-
-    return [x.strip() for x in response_strs]
-
-
-@torch.no_grad()
-def evaluate_gsm8k(
-    model,
-    tokenizer,
-    examples: list[dict[str, Any]],
-    eval_batch_size: int,
-    max_new_tokens: int,
-    device: torch.device,
-    max_logged_examples: int = 5,
-) -> dict[str, Any]:
-    sample_records = []
-    rewards = []
-    num_batches = math.ceil(len(examples) / eval_batch_size) if eval_batch_size > 0 else 0
-
-    for start in tqdm(
-        range(0, len(examples), eval_batch_size),
-        total=num_batches,
-        desc="Evaluating",
-        leave=True,
-        dynamic_ncols=True,
-    ):
-        batch_examples = examples[start:start + eval_batch_size]
-
-        prompt_strs = [build_prompt(ex["question"]) for ex in batch_examples]
-        gold_answers = [ex["answer"] for ex in batch_examples]
-
-        pred_responses = generate_responses(
-            model=model,
-            tokenizer=tokenizer,
-            prompt_strs=prompt_strs,
-            max_new_tokens=max_new_tokens,
-            device=device,
-        )
-
-        for prompt, pred, gold in zip(prompt_strs, pred_responses, gold_answers):
-            pred = truncate_response_for_reward(pred)
-            reward = reward_fn(pred, gold)
-            rewards.append(reward)
-
-            if len(sample_records) < max_logged_examples:
-                sample_records.append({
-                    "prompt": prompt,
-                    "prediction": pred,
-                    "gold": gold,
-                    "reward": reward,
-                })
-
-    metrics = summarize_rewards(rewards)
-
-    return {**metrics, "sample_records": sample_records}
-
-
-def run_vllm_eval_worker() -> None:
-    model_path = os.environ["CS336_VLLM_MODEL_PATH"]
-    tokenizer_path = os.environ["CS336_VLLM_TOKENIZER_PATH"]
-    payload_path = os.environ["CS336_VLLM_PAYLOAD_PATH"]
-    output_path = os.environ["CS336_VLLM_OUTPUT_PATH"]
-
-    from vllm import LLM, SamplingParams
-
-    with open(payload_path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-
-    examples = payload["examples"]
-    eval_batch_size = payload["eval_batch_size"]
-    max_new_tokens = payload["max_new_tokens"]
-    max_logged_examples = payload["max_logged_examples"]
-    gpu_memory_utilization = payload["gpu_memory_utilization"]
-
-    llm = LLM(
-        model=model_path,
-        tokenizer=tokenizer_path,
-        tensor_parallel_size=1,
-        trust_remote_code=True,
-        gpu_memory_utilization=gpu_memory_utilization,
-        enforce_eager=True,
-    )
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
-        max_tokens=max_new_tokens,
-        stop=["</answer>"],
-        include_stop_str_in_output=True,
-    )
-
-    sample_records = []
-    rewards = []
-    num_batches = math.ceil(len(examples) / eval_batch_size) if eval_batch_size > 0 else 0
-
-    for start in tqdm(
-        range(0, len(examples), eval_batch_size),
-        total=num_batches,
-        desc="Evaluating (vLLM)",
-        leave=True,
-        dynamic_ncols=True,
-    ):
-        batch_examples = examples[start:start + eval_batch_size]
-        prompt_strs = [build_prompt(ex["question"]) for ex in batch_examples]
-        gold_answers = [ex["answer"] for ex in batch_examples]
-
-        outputs = llm.generate(prompt_strs, sampling_params, use_tqdm=False)
-        pred_responses = [truncate_response_for_reward(out.outputs[0].text) for out in outputs]
-
-        for prompt, pred, gold in zip(prompt_strs, pred_responses, gold_answers):
-            reward = reward_fn(pred, gold)
-            rewards.append(reward)
-
-            if len(sample_records) < max_logged_examples:
-                sample_records.append(
-                    {
-                        "prompt": prompt,
-                        "prediction": pred,
-                        "gold": gold,
-                        "reward": reward,
-                    }
-                )
-
-    metrics = {
-        **summarize_rewards(rewards),
-        "sample_records": sample_records,
-    }
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, ensure_ascii=False)
-
-
-def evaluate_gsm8k_vllm_subprocess(
-    model_path: Path,
-    tokenizer_path: str,
-    examples: list[dict[str, Any]],
-    eval_batch_size: int,
-    max_new_tokens: int,
-    eval_gpu: int,
-    vllm_gpu_memory_utilization: float,
-    max_logged_examples: int = 5,
-) -> dict[str, Any]:
-    payload = {
-        "examples": examples,
-        "eval_batch_size": eval_batch_size,
-        "max_new_tokens": max_new_tokens,
-        "max_logged_examples": max_logged_examples,
-        "gpu_memory_utilization": vllm_gpu_memory_utilization,
-    }
-
-    with tempfile.TemporaryDirectory(prefix="vllm_eval_") as tmpdir:
-        payload_path = Path(tmpdir) / "payload.json"
-        output_path = Path(tmpdir) / "output.json"
-        with open(payload_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(eval_gpu)
-        env["CS336_VLLM_EVAL_WORKER"] = "1"
-        env["CS336_VLLM_MODEL_PATH"] = str(model_path)
-        env["CS336_VLLM_TOKENIZER_PATH"] = tokenizer_path
-        env["CS336_VLLM_PAYLOAD_PATH"] = str(payload_path)
-        env["CS336_VLLM_OUTPUT_PATH"] = str(output_path)
-
-        cmd = [sys.executable, str(Path(__file__).resolve())]
-        proc = subprocess.run(
-            cmd,
-            env=env,
-            check=False,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                "vLLM eval subprocess failed. "
-                f"Return code: {proc.returncode}"
-            )
-
-        with open(output_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-def save_checkpoint(model, tokenizer, save_dir: Path) -> None:
-    save_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(save_dir)
-    tokenizer.save_pretrained(save_dir)
-    print(f"Saved checkpoint to: {save_dir}")
-
-def train_sft(
-    model,
-    tokenizer,
-    train_examples: list[dict[str, Any]],
-    val_examples: list[dict[str, Any]],
-    cfg: Config,
-    device: torch.device,
-    out_dir: Path,
-    eval_fn,
-) -> dict[str, Any]:
-    train_dataset = GSM8KSFTDataset(train_examples)
-    collate_fn = make_sft_collate_fn(tokenizer)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.train_batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        drop_last=False,
-    )
-
-    if len(train_loader) == 0:
-        raise ValueError("train_loader is empty. Check your train set size and batch size.")
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
-    )
-
-    updates_per_epoch = math.ceil(len(train_loader) / cfg.gradient_accumulation_steps)
-    total_optimizer_steps = updates_per_epoch * cfg.num_epochs
-    warmup_steps = int(total_optimizer_steps * cfg.warmup_ratio)
-
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_optimizer_steps,
-    )
-
-    history = {
-        "train": [],
-        "val": [],
-    }
-
-    effective_batch_size = cfg.train_batch_size * cfg.gradient_accumulation_steps
-    print("Starting SFT training...")
-    print(f"Train examples: {len(train_examples)}")
-    print(f"Val examples:   {len(val_examples)}")
-    print(f"Epochs:         {cfg.num_epochs}")
-    print(f"Train batch:    {cfg.train_batch_size}")
-    print(f"Grad accum:     {cfg.gradient_accumulation_steps}")
-    print(f"Effective batch:{effective_batch_size}")
-    print(f"Eval every:     {cfg.eval_every} optimizer step(s)")
-    print(f"Log every:      {cfg.log_every} optimizer step(s)")
-    print(f"Learning rate:  {cfg.learning_rate}")
-    print(f"Device:         {device}")
-
-    # 先做一次训练前验证，方便画 curve
-    initial_val = eval_fn(model, tokenizer, val_examples)
-    initial_val["step"] = 0
-    history["val"].append(initial_val)
-    print(
-        f"[validation] step=0 reward={initial_val['reward']:.4f} "
-        f"num_examples={initial_val['num_examples']}"
-    )
-
-    best_val_reward = initial_val["reward"]
-    save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
-
-    optimizer.zero_grad(set_to_none=True)
-
-    optimizer_step = 0
-    running_group_loss = 0.0
-    microbatches_in_group = 0
-
-    for epoch in range(cfg.num_epochs):
-        model.train()
-        print(f"\nEpoch {epoch + 1}/{cfg.num_epochs}")
-
-        remainder = len(train_loader) % cfg.gradient_accumulation_steps
-
-        progress_bar = tqdm(
-            enumerate(train_loader),
-            total=len(train_loader),
-            desc=f"Epoch {epoch + 1}/{cfg.num_epochs}",
-        )
-        for micro_idx, batch in progress_bar:
-            if remainder != 0 and micro_idx >= len(train_loader) - remainder:
-                current_accum_steps = remainder
-            else:
-                current_accum_steps = cfg.gradient_accumulation_steps
-
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
-            response_mask = batch["response_mask"].to(device)
-
-            score_out = get_response_log_probs(
-                model=model,
-                input_ids=input_ids,
-                labels=labels,
-                return_token_entropy=False,
-            )
-            policy_log_probs = score_out["log_probs"]
-
-            normalize_constant = max(float(response_mask.sum().item()), 1.0)
-
-            loss, metadata = sft_microbatch_train_step(
-                policy_log_probs=policy_log_probs,
-                response_mask=response_mask,
-                gradient_accumulation_steps=current_accum_steps,
-                normalize_constant=normalize_constant,
-            )
-
-            running_group_loss += float(loss.detach().item())
-            microbatches_in_group += 1
-
-            should_step = (
-                microbatches_in_group == current_accum_steps
-                or micro_idx == len(train_loader) - 1
-            )
-
-            if should_step:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-
-                optimizer_step += 1
-
-                history["train"].append({
-                    "step": optimizer_step,
-                    "epoch": epoch,
-                    "loss": running_group_loss,
-                    "lr": scheduler.get_last_lr()[0],
-                })
-
-                progress_bar.set_postfix(
-                    step=optimizer_step,
-                    loss=f"{running_group_loss:.4f}",
-                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
-                )
-                if optimizer_step == 1 or optimizer_step % cfg.log_every == 0:
-                    print(
-                        f"[train] epoch={epoch + 1} step={optimizer_step} "
-                        f"loss={running_group_loss:.4f} "
-                        f"lr={scheduler.get_last_lr()[0]:.2e}"
-                    )
-
-                running_group_loss = 0.0
-                microbatches_in_group = 0
-
-                if optimizer_step % cfg.eval_every == 0:
-                    val_metrics = eval_fn(model, tokenizer, val_examples)
-                    val_metrics["step"] = optimizer_step
-                    history["val"].append(val_metrics)
-                    print(
-                        f"[validation] step={optimizer_step} "
-                        f"reward={val_metrics['reward']:.4f} "
-                        f"num_examples={val_metrics['num_examples']}"
-                    )
-
-                    if val_metrics["reward"] > best_val_reward:
-                        best_val_reward = val_metrics["reward"]
-                        print(
-                            f"New best validation reward: {best_val_reward:.4f} "
-                            f"at step {optimizer_step}"
-                        )
-                        save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
-
-    # 训练结束后再做一次验证
-    final_val = eval_fn(model, tokenizer, val_examples)
-    final_val["step"] = optimizer_step
-    history["val"].append(final_val)
-    print(
-        f"[validation] final_step={optimizer_step} "
-        f"reward={final_val['reward']:.4f} "
-        f"num_examples={final_val['num_examples']}"
-    )
-
-    if final_val["reward"] > best_val_reward:
-        best_val_reward = final_val["reward"]
-        print(f"Final model is the new best checkpoint with reward {best_val_reward:.4f}")
-        save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
-
-    print("Finished SFT training.")
-
-    return history
-
-def parse_args() -> Config:
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--train_jsonl", type=str, default='./data/gsm8k/train.jsonl')
-    parser.add_argument("--test_jsonl", type=str, default='./data/gsm8k/test.jsonl')
-    parser.add_argument("--out_dir", type=str, default='./outputs/gsm8k_sft')
-
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-Math-1.5B")
-    parser.add_argument("--val_jsonl", type=str, default=None)
-    parser.add_argument("--val_ratio", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=42)
-
-    parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--train_batch_size", type=int, default=4)
-    parser.add_argument("--eval_batch_size", type=int, default=8)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
-
-    parser.add_argument("--learning_rate", type=float, default=2e-5)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--warmup_ratio", type=float, default=0.03)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
-
-    parser.add_argument("--max_new_tokens", type=int, default=256)
-    parser.add_argument("--eval_every", type=int, default=100)
-    parser.add_argument("--log_every", type=int, default=10)
-    parser.add_argument("--eval_backend", type=str, default="torch", choices=["torch", "vllm"])
-
-    parser.add_argument("--max_train_examples", type=int, default=None)
-    parser.add_argument("--max_val_examples", type=int, default=None)
-    parser.add_argument("--max_test_examples", type=int, default=None)
-    parser.add_argument("--train_gpu", type=int, default=0)
-    parser.add_argument("--eval_gpu", type=int, default=1)
-    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.85)
-
-    args = parser.parse_args()
-    return Config(**vars(args))
+    from sft_train import save_checkpoint, train_sft
 
 
 def main():
@@ -725,11 +89,10 @@ def main():
 
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
-        if cfg.eval_backend == "vllm":
-            if cfg.eval_gpu < 0 or cfg.eval_gpu >= gpu_count:
-                raise ValueError(
-                    f"Requested eval_gpu={cfg.eval_gpu}, but only {gpu_count} CUDA device(s) are available."
-                )
+        if cfg.eval_backend == "vllm" and (cfg.eval_gpu < 0 or cfg.eval_gpu >= gpu_count):
+            raise ValueError(
+                f"Requested eval_gpu={cfg.eval_gpu}, but only {gpu_count} CUDA device(s) are available."
+            )
 
         print(f"Using train GPU: cuda:{cfg.train_gpu}")
         if cfg.eval_backend == "vllm":
@@ -743,10 +106,7 @@ def main():
     if device.type == "cuda":
         model_kwargs["torch_dtype"] = dtype
 
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model_name,
-        **model_kwargs,
-    )
+    model = AutoModelForCausalLM.from_pretrained(cfg.model_name, **model_kwargs)
     model.to(device)
 
     if cfg.eval_backend == "vllm":
@@ -764,6 +124,7 @@ def main():
                     eval_gpu=cfg.eval_gpu,
                     vllm_gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
                 )
+
     else:
 
         def eval_fn(eval_model, eval_tokenizer, examples):
@@ -808,10 +169,7 @@ def main():
         if device.type == "cuda":
             best_model_kwargs["torch_dtype"] = dtype
 
-        best_model = AutoModelForCausalLM.from_pretrained(
-            best_ckpt_dir,
-            **best_model_kwargs,
-        )
+        best_model = AutoModelForCausalLM.from_pretrained(best_ckpt_dir, **best_model_kwargs)
         best_model.to(device)
 
         test_metrics = evaluate_gsm8k(
