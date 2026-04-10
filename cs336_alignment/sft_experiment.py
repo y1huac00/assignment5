@@ -363,6 +363,7 @@ def run_vllm_eval_worker() -> None:
         tensor_parallel_size=1,
         trust_remote_code=True,
         gpu_memory_utilization=gpu_memory_utilization,
+        enforce_eager=True,
     )
     sampling_params = SamplingParams(
         temperature=0.0,
