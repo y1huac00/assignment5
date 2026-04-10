@@ -373,7 +373,7 @@ def run_vllm_eval_worker() -> None:
         prompt_strs = [build_prompt(ex["question"]) for ex in batch_examples]
         gold_answers = [ex["answer"] for ex in batch_examples]
 
-        outputs = llm.generate(prompt_strs, sampling_params)
+        outputs = llm.generate(prompt_strs, sampling_params, use_tqdm=False)
         pred_responses = [truncate_response_for_reward(out.outputs[0].text) for out in outputs]
 
         for prompt, pred, gold in zip(prompt_strs, pred_responses, gold_answers):
