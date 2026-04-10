@@ -301,6 +301,7 @@ def train_sft(
                 f"num_examples={final_val['num_examples']}"
             )
 
+    save_checkpoint(model, tokenizer, out_dir / "last_ckpt")
     print("Finished SFT training.")
     if wandb_run is not None:
         wandb_run.summary["best_val_reward"] = best_val_reward

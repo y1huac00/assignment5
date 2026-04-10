@@ -379,7 +379,9 @@ def main() -> None:
                     print(f"[skip] {run_name} step={step_idx} already completed")
                     step_summary = load_json(step_summary_path)
                     step_summaries.append(step_summary)
-                    next_policy_path = step_dir / "sft_run" / "best_ckpt"
+                    next_policy_path = step_dir / "sft_run" / "last_ckpt"
+                    if not next_policy_path.exists():
+                        next_policy_path = step_dir / "sft_run" / "best_ckpt"
                     if next_policy_path.exists():
                         current_policy_path = str(next_policy_path)
                     continue
@@ -461,7 +463,10 @@ def main() -> None:
                     json.dump(step_summary, f, ensure_ascii=False, indent=2)
 
                 step_summaries.append(step_summary)
-                current_policy_path = str(sft_run_dir / "best_ckpt")
+                next_policy_path = sft_run_dir / "last_ckpt"
+                if not next_policy_path.exists():
+                    next_policy_path = sft_run_dir / "best_ckpt"
+                current_policy_path = str(next_policy_path)
 
             run_summary = {
                 "G": g_value,
