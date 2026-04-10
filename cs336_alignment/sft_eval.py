@@ -186,6 +186,7 @@ def run_vllm_eval_worker() -> None:
         trust_remote_code=True,
         gpu_memory_utilization=gpu_memory_utilization,
         enforce_eager=True,
+        disable_log_stats=True,
     )
     sampling_params = SamplingParams(
         temperature=0.0,
@@ -263,6 +264,9 @@ def evaluate_gsm8k_vllm_subprocess(
         env["CS336_VLLM_TOKENIZER_PATH"] = tokenizer_path
         env["CS336_VLLM_PAYLOAD_PATH"] = str(payload_path)
         env["CS336_VLLM_OUTPUT_PATH"] = str(output_path)
+        env["VLLM_LOGGING_LEVEL"] = "ERROR"
+        env["VLLM_NO_USAGE_STATS"] = "1"
+        env["VLLM_DO_NOT_TRACK"] = "1"
 
         cmd = [sys.executable, "-m", "cs336_alignment.sft_experiment"]
         proc = subprocess.run(cmd, env=env, check=False)
