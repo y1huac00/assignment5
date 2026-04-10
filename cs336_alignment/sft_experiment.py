@@ -3,7 +3,6 @@ import json
 import math
 import os
 import random
-import re
 import subprocess
 import sys
 import tempfile
@@ -11,6 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
 from tqdm import tqdm
 
 import torch
@@ -22,28 +22,17 @@ from transformers import (
 )
 
 try:
-    from .drgrpo_grader import r1_zero_reward_fn
     from .helper import (
         tokenize_prompt_and_output,
         get_response_log_probs,
         sft_microbatch_train_step,
     )
 except ImportError:
-    from drgrpo_grader import r1_zero_reward_fn
     from helper import (
         tokenize_prompt_and_output,
         get_response_log_probs,
         sft_microbatch_train_step,
     )
-
-
-R1_ZERO_SYSTEM_PROMPT = (
-    "A conversation between User and Assistant. The User asks a question, and the "
-    "Assistant solves it. The Assistant first thinks about the reasoning process in "
-    "the mind and then provides the User with the answer. The reasoning process is "
-    "enclosed within <think> </think> and the answer is enclosed within <answer> "
-    "</answer> tags, respectively.\n"
-)
 
 @dataclass
 class Config:
@@ -121,48 +110,11 @@ def maybe_truncate(
 
 def build_prompt(question: str) -> str:
     question = question.strip()
-    return f"{R1_ZERO_SYSTEM_PROMPT}User: {question}\nAssistant: <think>"
+    return f"Question: {question}\nAnswer:"
 
 
 def build_train_response(answer: str) -> str:
-    reasoning, final_answer = split_gsm8k_answer(answer)
-    return f" {reasoning} </think> <answer> {final_answer} </answer>"
-
-
-def extract_final_answer(text: str) -> str:
-    """
-    GSM8K 常见格式是:
-    '... reasoning ... #### 72'
-    我们优先取 #### 后面的最终答案。
-    如果没有 ####，就取最后一个数字。
-    """
-    text = text.replace("<answer>", " ").replace("</answer>", " ").strip()
-
-    if "####" in text:
-        text = text.split("####")[-1].strip()
-
-    text = text.replace(",", "")
-    matches = re.findall(r"-?\d+(?:\.\d+)?", text)
-    if matches:
-        return matches[-1]
-
-    return " ".join(text.lower().split())
-
-
-def is_correct_gsm8k(pred_text: str, gold_text: str) -> bool:
-    return extract_final_answer(pred_text) == extract_final_answer(gold_text)
-
-
-def split_gsm8k_answer(answer: str) -> tuple[str, str]:
-    answer = answer.strip()
-    if "####" in answer:
-        reasoning, final_answer = answer.rsplit("####", 1)
-        reasoning = reasoning.strip()
-        final_answer = final_answer.strip()
-    else:
-        reasoning = answer
-        final_answer = extract_final_answer(answer)
-    return reasoning, final_answer
+    return " " + answer.strip()
 
 
 def truncate_response_for_reward(text: str) -> str:
@@ -173,27 +125,55 @@ def truncate_response_for_reward(text: str) -> str:
     return text.strip()
 
 
-def summarize_reward_infos(reward_infos: list[dict[str, float]]) -> dict[str, float]:
-    num_examples = len(reward_infos)
+def prepare_text_for_math_verify(text: str) -> str:
+    text = truncate_response_for_reward(text).strip()
+    if "####" in text:
+        text = text.split("####")[-1].strip()
+    return text
+
+
+def reward_fn(pred_text: str, gold_text: str) -> float:
+    try:
+        gold_parsed = parse(
+            prepare_text_for_math_verify(gold_text),
+            extraction_config=(
+                LatexExtractionConfig(boxed_match_priority=0),
+                ExprExtractionConfig(),
+            ),
+            fallback_mode="no_fallback",
+            extraction_mode="first_match",
+            parsing_timeout=1,
+        )
+        pred_parsed = parse(
+            prepare_text_for_math_verify(pred_text),
+            extraction_config=(
+                LatexExtractionConfig(boxed_match_priority=0),
+                ExprExtractionConfig(),
+            ),
+            fallback_mode="no_fallback",
+            extraction_mode="first_match",
+            parsing_timeout=1,
+        )
+        return 1.0 if verify(gold_parsed, pred_parsed) else 0.0
+    except Exception:
+        return 0.0
+
+
+def summarize_rewards(rewards: list[float]) -> dict[str, float]:
+    num_examples = len(rewards)
     if num_examples == 0:
         return {
             "num_examples": 0,
-            "format_reward": 0.0,
-            "answer_reward": 0.0,
             "reward": 0.0,
             "accuracy": 0.0,
         }
 
-    format_reward = sum(info.get("format_reward", 0.0) for info in reward_infos) / num_examples
-    answer_reward = sum(info.get("answer_reward", 0.0) for info in reward_infos) / num_examples
-    reward = sum(info.get("reward", 0.0) for info in reward_infos) / num_examples
+    reward = sum(rewards) / num_examples
 
     return {
         "num_examples": num_examples,
-        "format_reward": format_reward,
-        "answer_reward": answer_reward,
         "reward": reward,
-        "accuracy": answer_reward,
+        "accuracy": reward,
     }
 
 
@@ -304,14 +284,15 @@ def evaluate_gsm8k(
     max_logged_examples: int = 5,
 ) -> dict[str, Any]:
     sample_records = []
-    reward_infos = []
+    rewards = []
     num_batches = math.ceil(len(examples) / eval_batch_size) if eval_batch_size > 0 else 0
 
     for start in tqdm(
         range(0, len(examples), eval_batch_size),
         total=num_batches,
         desc="Evaluating",
-        leave=False,
+        leave=True,
+        dynamic_ncols=True,
     ):
         batch_examples = examples[start:start + eval_batch_size]
 
@@ -328,20 +309,18 @@ def evaluate_gsm8k(
 
         for prompt, pred, gold in zip(prompt_strs, pred_responses, gold_answers):
             pred = truncate_response_for_reward(pred)
-            rewards = r1_zero_reward_fn(pred, gold)
-            reward_infos.append(rewards)
+            reward = reward_fn(pred, gold)
+            rewards.append(reward)
 
             if len(sample_records) < max_logged_examples:
                 sample_records.append({
                     "prompt": prompt,
                     "prediction": pred,
                     "gold": gold,
-                    "format_reward": rewards["format_reward"],
-                    "answer_reward": rewards["answer_reward"],
-                    "reward": rewards["reward"],
+                    "reward": reward,
                 })
 
-    metrics = summarize_reward_infos(reward_infos)
+    metrics = summarize_rewards(rewards)
 
     return {**metrics, "sample_records": sample_records}
 
@@ -380,14 +359,15 @@ def run_vllm_eval_worker() -> None:
     )
 
     sample_records = []
-    reward_infos = []
+    rewards = []
     num_batches = math.ceil(len(examples) / eval_batch_size) if eval_batch_size > 0 else 0
 
     for start in tqdm(
         range(0, len(examples), eval_batch_size),
         total=num_batches,
         desc="Evaluating (vLLM)",
-        leave=False,
+        leave=True,
+        dynamic_ncols=True,
     ):
         batch_examples = examples[start:start + eval_batch_size]
         prompt_strs = [build_prompt(ex["question"]) for ex in batch_examples]
@@ -397,8 +377,8 @@ def run_vllm_eval_worker() -> None:
         pred_responses = [truncate_response_for_reward(out.outputs[0].text) for out in outputs]
 
         for prompt, pred, gold in zip(prompt_strs, pred_responses, gold_answers):
-            rewards = r1_zero_reward_fn(pred, gold)
-            reward_infos.append(rewards)
+            reward = reward_fn(pred, gold)
+            rewards.append(reward)
 
             if len(sample_records) < max_logged_examples:
                 sample_records.append(
@@ -406,14 +386,12 @@ def run_vllm_eval_worker() -> None:
                         "prompt": prompt,
                         "prediction": pred,
                         "gold": gold,
-                        "format_reward": rewards["format_reward"],
-                        "answer_reward": rewards["answer_reward"],
-                        "reward": rewards["reward"],
+                        "reward": reward,
                     }
                 )
 
     metrics = {
-        **summarize_reward_infos(reward_infos),
+        **summarize_rewards(rewards),
         "sample_records": sample_records,
     }
 
@@ -457,15 +435,12 @@ def evaluate_gsm8k_vllm_subprocess(
         proc = subprocess.run(
             cmd,
             env=env,
-            capture_output=True,
-            text=True,
             check=False,
         )
         if proc.returncode != 0:
             raise RuntimeError(
-                "vLLM eval subprocess failed.\n"
-                f"stdout:\n{proc.stdout}\n"
-                f"stderr:\n{proc.stderr}"
+                "vLLM eval subprocess failed. "
+                f"Return code: {proc.returncode}"
             )
 
         with open(output_path, "r", encoding="utf-8") as f:
@@ -540,9 +515,7 @@ def train_sft(
     initial_val["step"] = 0
     history["val"].append(initial_val)
     print(
-        f"[validation] step=0 format_reward={initial_val['format_reward']:.4f} "
-        f"answer_reward={initial_val['answer_reward']:.4f} "
-        f"reward={initial_val['reward']:.4f} "
+        f"[validation] step=0 reward={initial_val['reward']:.4f} "
         f"num_examples={initial_val['num_examples']}"
     )
 
@@ -637,8 +610,6 @@ def train_sft(
                     history["val"].append(val_metrics)
                     print(
                         f"[validation] step={optimizer_step} "
-                        f"format_reward={val_metrics['format_reward']:.4f} "
-                        f"answer_reward={val_metrics['answer_reward']:.4f} "
                         f"reward={val_metrics['reward']:.4f} "
                         f"num_examples={val_metrics['num_examples']}"
                     )
@@ -657,8 +628,6 @@ def train_sft(
     history["val"].append(final_val)
     print(
         f"[validation] final_step={optimizer_step} "
-        f"format_reward={final_val['format_reward']:.4f} "
-        f"answer_reward={final_val['answer_reward']:.4f} "
         f"reward={final_val['reward']:.4f} "
         f"num_examples={final_val['num_examples']}"
     )
@@ -857,12 +826,7 @@ def main():
     with open(out_dir / "test_metrics.json", "w", encoding="utf-8") as f:
         json.dump(test_metrics, f, ensure_ascii=False, indent=2)
 
-    print(
-        "Final test metrics: "
-        f"format_reward={test_metrics['format_reward']:.4f}, "
-        f"answer_reward={test_metrics['answer_reward']:.4f}, "
-        f"reward={test_metrics['reward']:.4f}"
-    )
+    print(f"Final test reward: {test_metrics['reward']:.4f}")
     print("Done.")
 
 

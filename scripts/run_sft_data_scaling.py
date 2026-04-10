@@ -78,16 +78,12 @@ def summarize_run(run_out_dir: Path, size: str) -> dict[str, Any]:
         summary["num_val_evals"] = len(val_history)
         if val_history:
             best_val = max(val_history, key=lambda item: item.get("reward", float("-inf")))
-            summary["best_val_format_reward"] = best_val.get("format_reward")
-            summary["best_val_answer_reward"] = best_val.get("answer_reward")
             summary["best_val_reward"] = best_val.get("reward")
             summary["best_val_accuracy"] = best_val.get("accuracy")
             summary["best_val_step"] = best_val.get("step")
 
     if test_metrics_path.exists():
         test_metrics = load_json(test_metrics_path)
-        summary["test_format_reward"] = test_metrics.get("format_reward")
-        summary["test_answer_reward"] = test_metrics.get("answer_reward")
         summary["test_reward"] = test_metrics.get("reward")
         summary["test_accuracy"] = test_metrics.get("accuracy")
         summary["test_num_examples"] = test_metrics.get("num_examples")
@@ -151,9 +147,7 @@ def main() -> None:
         print(
             f"train_size={result['train_size']}\t"
             f"best_val_reward={result.get('best_val_reward')}\t"
-            f"best_val_answer_reward={result.get('best_val_answer_reward')}\t"
-            f"test_reward={result.get('test_reward')}\t"
-            f"test_answer_reward={result.get('test_answer_reward')}"
+            f"test_reward={result.get('test_reward')}"
         )
 
 
