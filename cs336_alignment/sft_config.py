@@ -35,8 +35,8 @@ class Config:
     wandb_group: str | None = None
 
     max_train_examples: int | None = None
-    max_val_examples: int | None = None
-    max_test_examples: int | None = None
+    max_val_examples: int | None = 64
+    max_test_examples: int | None = 128
 
     train_gpu: int = 0
     eval_gpu: int = 1
@@ -77,8 +77,8 @@ def parse_args() -> Config:
     parser.add_argument("--wandb_group", type=str, default=None)
 
     parser.add_argument("--max_train_examples", type=int, default=None)
-    parser.add_argument("--max_val_examples", type=int, default=None)
-    parser.add_argument("--max_test_examples", type=int, default=None)
+    parser.add_argument("--max_val_examples", type=int, default=64)
+    parser.add_argument("--max_test_examples", type=int, default=128)
     parser.add_argument("--train_gpu", type=int, default=0)
     parser.add_argument("--eval_gpu", type=int, default=1)
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.85)
