@@ -24,6 +24,14 @@ from typing import Any
 DEFAULT_TRAIN_SIZES = ["128", "256", "512", "1024", "all"]
 
 
+def has_flag(args: list[str], flag: str) -> bool:
+    return flag in args
+
+
+def has_option(args: list[str], option: str) -> bool:
+    return option in args
+
+
 def parse_size(size: str) -> int | None:
     if size == "all":
         return None
@@ -38,6 +46,8 @@ def load_json(path: Path) -> dict[str, Any]:
 def build_run_command(
     run_out_dir: Path,
     size: str,
+    run_name: str,
+    wandb_group: str,
     forwarded_args: list[str],
 ) -> list[str]:
     cmd = [
@@ -53,6 +63,11 @@ def build_run_command(
         cmd.extend(["--max_train_examples", str(max_train_examples)])
 
     cmd.extend(forwarded_args)
+    if has_flag(forwarded_args, "--use_wandb"):
+        if not has_option(forwarded_args, "--wandb_group"):
+            cmd.extend(["--wandb_group", wandb_group])
+        if not has_option(forwarded_args, "--wandb_name"):
+            cmd.extend(["--wandb_name", run_name])
     return cmd
 
 
@@ -117,12 +132,14 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     base_out_dir = Path(args.base_out_dir)
     base_out_dir.mkdir(parents=True, exist_ok=True)
+    wandb_group = base_out_dir.name
 
     results = []
 
     for size in args.sizes:
         parse_size(size)
-        run_out_dir = base_out_dir / f"train_{size}"
+        run_name = f"train_{size}"
+        run_out_dir = base_out_dir / run_name
         test_metrics_path = run_out_dir / "test_metrics.json"
 
         if args.skip_if_complete and test_metrics_path.exists():
@@ -131,6 +148,8 @@ def main() -> None:
             cmd = build_run_command(
                 run_out_dir=run_out_dir,
                 size=size,
+                run_name=run_name,
+                wandb_group=wandb_group,
                 forwarded_args=forwarded_args,
             )
             print(f"[run] train_size={size}")

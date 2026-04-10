@@ -23,8 +23,16 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_LEARNING_RATES = ["1e-5", "2e-5", "5e-5"]
+DEFAULT_LEARNING_RATES = ["5e-6", "1e-5", "2e-5"]
 DEFAULT_GRADIENT_ACCUMULATION_STEPS = ["4", "8", "16"]
+
+
+def has_flag(args: list[str], flag: str) -> bool:
+    return flag in args
+
+
+def has_option(args: list[str], option: str) -> bool:
+    return option in args
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -43,6 +51,8 @@ def build_run_name(learning_rate: str, gradient_accumulation_steps: int) -> str:
 
 def build_run_command(
     run_out_dir: Path,
+    run_name: str,
+    wandb_group: str,
     learning_rate: str,
     train_batch_size: int,
     gradient_accumulation_steps: int,
@@ -63,6 +73,11 @@ def build_run_command(
     ]
 
     cmd.extend(forwarded_args)
+    if has_flag(forwarded_args, "--use_wandb"):
+        if not has_option(forwarded_args, "--wandb_group"):
+            cmd.extend(["--wandb_group", wandb_group])
+        if not has_option(forwarded_args, "--wandb_name"):
+            cmd.extend(["--wandb_name", run_name])
     return cmd
 
 
@@ -151,6 +166,7 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     base_out_dir = Path(args.base_out_dir)
     base_out_dir.mkdir(parents=True, exist_ok=True)
+    wandb_group = base_out_dir.name
 
     learning_rates = args.learning_rates
     gradient_accumulation_steps_list = [int(value) for value in args.gradient_accumulation_steps]
@@ -167,6 +183,8 @@ def main() -> None:
             else:
                 cmd = build_run_command(
                     run_out_dir=run_out_dir,
+                    run_name=run_name,
+                    wandb_group=wandb_group,
                     learning_rate=learning_rate,
                     train_batch_size=args.train_batch_size,
                     gradient_accumulation_steps=gradient_accumulation_steps,

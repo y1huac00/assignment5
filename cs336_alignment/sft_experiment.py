@@ -51,6 +51,8 @@ def main():
 
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    default_wandb_group = out_dir.parent.name or "default"
+    default_wandb_name = out_dir.name
 
     wandb_run = None
     if cfg.use_wandb:
@@ -65,8 +67,8 @@ def main():
         wandb_run = wandb.init(
             project=cfg.wandb_project,
             entity=cfg.wandb_entity,
-            name=cfg.wandb_name,
-            group=cfg.wandb_group,
+            name=cfg.wandb_name or default_wandb_name,
+            group=cfg.wandb_group or default_wandb_group,
             config=asdict(cfg),
             dir=str(out_dir),
         )
