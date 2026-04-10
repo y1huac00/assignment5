@@ -10,6 +10,7 @@ import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
 from tqdm import tqdm
 
 import torch
@@ -20,10 +21,28 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
-from helper import (
-    tokenize_prompt_and_output,
-    get_response_log_probs,
-    sft_microbatch_train_step,
+try:
+    from .drgrpo_grader import r1_zero_reward_fn
+    from .helper import (
+        tokenize_prompt_and_output,
+        get_response_log_probs,
+        sft_microbatch_train_step,
+    )
+except ImportError:
+    from drgrpo_grader import r1_zero_reward_fn
+    from helper import (
+        tokenize_prompt_and_output,
+        get_response_log_probs,
+        sft_microbatch_train_step,
+    )
+
+
+R1_ZERO_SYSTEM_PROMPT = (
+    "A conversation between User and Assistant. The User asks a question, and the "
+    "Assistant solves it. The Assistant first thinks about the reasoning process in "
+    "the mind and then provides the User with the answer. The reasoning process is "
+    "enclosed within <think> </think> and the answer is enclosed within <answer> "
+    "</answer> tags, respectively.\n"
 )
 
 @dataclass
@@ -102,12 +121,12 @@ def maybe_truncate(
 
 def build_prompt(question: str) -> str:
     question = question.strip()
-    return f"Question: {question}\nAnswer:"
+    return f"{R1_ZERO_SYSTEM_PROMPT}User: {question}\nAssistant: <think>"
 
 
 def build_train_response(answer: str) -> str:
-    # 前面补一个空格，通常对 tokenizer 更自然一些
-    return " " + answer.strip()
+    reasoning, final_answer = split_gsm8k_answer(answer)
+    return f" {reasoning} </think> <answer> {final_answer} </answer>"
 
 
 def extract_final_answer(text: str) -> str:
@@ -132,6 +151,50 @@ def extract_final_answer(text: str) -> str:
 
 def is_correct_gsm8k(pred_text: str, gold_text: str) -> bool:
     return extract_final_answer(pred_text) == extract_final_answer(gold_text)
+
+
+def split_gsm8k_answer(answer: str) -> tuple[str, str]:
+    answer = answer.strip()
+    if "####" in answer:
+        reasoning, final_answer = answer.rsplit("####", 1)
+        reasoning = reasoning.strip()
+        final_answer = final_answer.strip()
+    else:
+        reasoning = answer
+        final_answer = extract_final_answer(answer)
+    return reasoning, final_answer
+
+
+def truncate_response_for_reward(text: str) -> str:
+    end_tag = "</answer>"
+    if end_tag in text:
+        end_idx = text.index(end_tag) + len(end_tag)
+        return text[:end_idx].strip()
+    return text.strip()
+
+
+def summarize_reward_infos(reward_infos: list[dict[str, float]]) -> dict[str, float]:
+    num_examples = len(reward_infos)
+    if num_examples == 0:
+        return {
+            "num_examples": 0,
+            "format_reward": 0.0,
+            "answer_reward": 0.0,
+            "reward": 0.0,
+            "accuracy": 0.0,
+        }
+
+    format_reward = sum(info.get("format_reward", 0.0) for info in reward_infos) / num_examples
+    answer_reward = sum(info.get("answer_reward", 0.0) for info in reward_infos) / num_examples
+    reward = sum(info.get("reward", 0.0) for info in reward_infos) / num_examples
+
+    return {
+        "num_examples": num_examples,
+        "format_reward": format_reward,
+        "answer_reward": answer_reward,
+        "reward": reward,
+        "accuracy": answer_reward,
+    }
 
 
 def choose_torch_dtype() -> torch.dtype:
@@ -240,9 +303,8 @@ def evaluate_gsm8k(
     device: torch.device,
     max_logged_examples: int = 5,
 ) -> dict[str, Any]:
-    all_correct = 0
-    total = 0
     sample_records = []
+    reward_infos = []
 
     for start in range(0, len(examples), eval_batch_size):
         batch_examples = examples[start:start + eval_batch_size]
@@ -259,27 +321,23 @@ def evaluate_gsm8k(
         )
 
         for prompt, pred, gold in zip(prompt_strs, pred_responses, gold_answers):
-            correct = is_correct_gsm8k(pred, gold)
-            all_correct += int(correct)
-            total += 1
+            pred = truncate_response_for_reward(pred)
+            rewards = r1_zero_reward_fn(pred, gold)
+            reward_infos.append(rewards)
 
             if len(sample_records) < max_logged_examples:
                 sample_records.append({
                     "prompt": prompt,
                     "prediction": pred,
                     "gold": gold,
-                    "pred_final": extract_final_answer(pred),
-                    "gold_final": extract_final_answer(gold),
-                    "correct": correct,
+                    "format_reward": rewards["format_reward"],
+                    "answer_reward": rewards["answer_reward"],
+                    "reward": rewards["reward"],
                 })
 
-    accuracy = all_correct / total if total > 0 else 0.0
+    metrics = summarize_reward_infos(reward_infos)
 
-    return {
-        "accuracy": accuracy,
-        "num_examples": total,
-        "sample_records": sample_records,
-    }
+    return {**metrics, "sample_records": sample_records}
 
 
 def run_vllm_eval_worker() -> None:
@@ -308,11 +366,12 @@ def run_vllm_eval_worker() -> None:
         temperature=0.0,
         top_p=1.0,
         max_tokens=max_new_tokens,
+        stop=["</answer>"],
+        include_stop_str_in_output=True,
     )
 
-    all_correct = 0
-    total = 0
     sample_records = []
+    reward_infos = []
 
     for start in range(0, len(examples), eval_batch_size):
         batch_examples = examples[start:start + eval_batch_size]
@@ -320,12 +379,11 @@ def run_vllm_eval_worker() -> None:
         gold_answers = [ex["answer"] for ex in batch_examples]
 
         outputs = llm.generate(prompt_strs, sampling_params)
-        pred_responses = [out.outputs[0].text.strip() for out in outputs]
+        pred_responses = [truncate_response_for_reward(out.outputs[0].text) for out in outputs]
 
         for prompt, pred, gold in zip(prompt_strs, pred_responses, gold_answers):
-            correct = is_correct_gsm8k(pred, gold)
-            all_correct += int(correct)
-            total += 1
+            rewards = r1_zero_reward_fn(pred, gold)
+            reward_infos.append(rewards)
 
             if len(sample_records) < max_logged_examples:
                 sample_records.append(
@@ -333,16 +391,14 @@ def run_vllm_eval_worker() -> None:
                         "prompt": prompt,
                         "prediction": pred,
                         "gold": gold,
-                        "pred_final": extract_final_answer(pred),
-                        "gold_final": extract_final_answer(gold),
-                        "correct": correct,
+                        "format_reward": rewards["format_reward"],
+                        "answer_reward": rewards["answer_reward"],
+                        "reward": rewards["reward"],
                     }
                 )
 
-    accuracy = all_correct / total if total > 0 else 0.0
     metrics = {
-        "accuracy": accuracy,
-        "num_examples": total,
+        **summarize_reward_infos(reward_infos),
         "sample_records": sample_records,
     }
 
@@ -467,11 +523,13 @@ def train_sft(
     initial_val["step"] = 0
     history["val"].append(initial_val)
     print(
-        f"[validation] step=0 accuracy={initial_val['accuracy']:.4f} "
+        f"[validation] step=0 format_reward={initial_val['format_reward']:.4f} "
+        f"answer_reward={initial_val['answer_reward']:.4f} "
+        f"reward={initial_val['reward']:.4f} "
         f"num_examples={initial_val['num_examples']}"
     )
 
-    best_val_acc = initial_val["accuracy"]
+    best_val_reward = initial_val["reward"]
     save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
 
     optimizer.zero_grad(set_to_none=True)
@@ -562,14 +620,16 @@ def train_sft(
                     history["val"].append(val_metrics)
                     print(
                         f"[validation] step={optimizer_step} "
-                        f"accuracy={val_metrics['accuracy']:.4f} "
+                        f"format_reward={val_metrics['format_reward']:.4f} "
+                        f"answer_reward={val_metrics['answer_reward']:.4f} "
+                        f"reward={val_metrics['reward']:.4f} "
                         f"num_examples={val_metrics['num_examples']}"
                     )
 
-                    if val_metrics["accuracy"] > best_val_acc:
-                        best_val_acc = val_metrics["accuracy"]
+                    if val_metrics["reward"] > best_val_reward:
+                        best_val_reward = val_metrics["reward"]
                         print(
-                            f"New best validation accuracy: {best_val_acc:.4f} "
+                            f"New best validation reward: {best_val_reward:.4f} "
                             f"at step {optimizer_step}"
                         )
                         save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
@@ -580,13 +640,15 @@ def train_sft(
     history["val"].append(final_val)
     print(
         f"[validation] final_step={optimizer_step} "
-        f"accuracy={final_val['accuracy']:.4f} "
+        f"format_reward={final_val['format_reward']:.4f} "
+        f"answer_reward={final_val['answer_reward']:.4f} "
+        f"reward={final_val['reward']:.4f} "
         f"num_examples={final_val['num_examples']}"
     )
 
-    if final_val["accuracy"] > best_val_acc:
-        best_val_acc = final_val["accuracy"]
-        print(f"Final model is the new best checkpoint with accuracy {best_val_acc:.4f}")
+    if final_val["reward"] > best_val_reward:
+        best_val_reward = final_val["reward"]
+        print(f"Final model is the new best checkpoint with reward {best_val_reward:.4f}")
         save_checkpoint(model, tokenizer, out_dir / "best_ckpt")
 
     print("Finished SFT training.")
@@ -776,7 +838,12 @@ def main():
     with open(out_dir / "test_metrics.json", "w", encoding="utf-8") as f:
         json.dump(test_metrics, f, ensure_ascii=False, indent=2)
 
-    print(f"Final test accuracy: {test_metrics['accuracy']:.4f}")
+    print(
+        "Final test metrics: "
+        f"format_reward={test_metrics['format_reward']:.4f}, "
+        f"answer_reward={test_metrics['answer_reward']:.4f}, "
+        f"reward={test_metrics['reward']:.4f}"
+    )
     print("Done.")
 
 
